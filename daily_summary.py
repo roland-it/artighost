@@ -162,7 +162,6 @@ def extract_inline_images(email: dict) -> list[dict]:
     try:
         attachments = graph_get(
             f"/users/{mailbox}/messages/{message_id}/attachments",
-            params={"$select": "id,name,contentType,contentId,isInline"},
         )
         for att in attachments.get("value", []):
             if not att.get("isInline"):
@@ -210,7 +209,10 @@ You are analyzing a monitoring email received by the IT team at Roland Foods.
 Today is {today_str}. Yesterday was {yesterday_str}.
 
 Roland Foods receives these types of monitoring emails:
-- Financial/operational reports with numerical data in images (totals, comparisons). Flag any discrepancy over 1,000 between figures that should match. Also flag if yesterday's date ({yesterday_str}) does not appear in a list of dates in the image, unless yesterday was a Saturday or Sunday.
+- Financial/operational reports with numerical data in images. Perform TWO independent checks:
+  1. NUMBER CHECK: The image contains two tables stacked vertically, each with two columns of numbers and a grand total row at the bottom. Compare the grand total in the LEFT column of the TOP table against the highlighted total in the LEFT column of the BOTTOM table. If they differ by more than 1,000, flag as warning and include both numbers in your summary.
+  2. DATE CHECK: Flag if yesterday's date ({yesterday_str}) does not appear in a list of dates in the image, unless yesterday was a Saturday or Sunday. Only apply this check if the email explicitly contains a list or table of dates.
+  Both checks must pass independently for status to be "ok". Include the actual numbers you read from the image in your summary.
 - Order mismatch reports showing tabular data of orders needing correction. State exact count or confirm zero.
 - Process/job failure alerts. Summarize what failed and any available context.
 - General system status updates.
