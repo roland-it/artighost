@@ -1,0 +1,7 @@
+slack-bolt>=1.18
+slack-sdk>=3.26
+openai>=1.30
+python-dotenv>=1.0
+requests>=2.31
+chromadb>=0.5
+beautifulsoup4>=4.12
