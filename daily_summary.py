@@ -162,6 +162,7 @@ def extract_inline_images(email: dict) -> list[dict]:
     try:
         attachments = graph_get(
             f"/users/{mailbox}/messages/{message_id}/attachments",
+            params={"$select": "id,name,contentType,contentId,isInline"},
         )
         for att in attachments.get("value", []):
             if not att.get("isInline"):
@@ -193,24 +194,36 @@ def mark_as_read(message_id: str) -> None:
 # Per-email vision analysis
 # ---------------------------------------------------------------------------
 
-EMAIL_ANALYSIS_PROMPT = """
+def build_email_analysis_prompt() -> str:
+    from datetime import date, timedelta
+    from zoneinfo import ZoneInfo
+    eastern = ZoneInfo("America/New_York")
+    from datetime import datetime
+    today = datetime.now(eastern).date()
+    yesterday = today - timedelta(days=1)
+    today_str = today.strftime("%A, %B %d, %Y")
+    yesterday_str = yesterday.strftime("%A, %B %d, %Y")
+
+    return f"""
 You are analyzing a monitoring email received by the IT team at Roland Foods.
 
+Today is {today_str}. Yesterday was {yesterday_str}.
+
 Roland Foods receives these types of monitoring emails:
-- Financial/operational reports with numerical data in images (totals, comparisons). Flag any discrepancy over 1,000 between figures that should match.
+- Financial/operational reports with numerical data in images (totals, comparisons). Flag any discrepancy over 1,000 between figures that should match. Also flag if yesterday's date ({yesterday_str}) does not appear in a list of dates in the image, unless yesterday was a Saturday or Sunday.
 - Order mismatch reports showing tabular data of orders needing correction. State exact count or confirm zero.
 - Process/job failure alerts. Summarize what failed and any available context.
 - General system status updates.
 - Spam or non-IT-relevant content.
 
 Analyze the email including any images. Respond with JSON only:
-{
+{{
   "classification": "financial_report|order_mismatch|process_failure|system_status|ignore",
   "status": "ok|warning|error|ignore",
   "summary": "one or two sentence factual summary with specific numbers from images where available",
   "action_required": true/false,
   "action_note": "what needs to be done, or null"
-}
+}}
 
 Be specific. Use actual numbers you can see in images. Do not be vague.
 If the email is clearly spam or non-IT-relevant, classify as ignore.
@@ -247,7 +260,7 @@ def analyze_email(email: dict, images: list) -> dict:
         response = openai_client.chat.completions.create(
             model="gpt-4o-1",
             messages=[
-                {"role": "system", "content": EMAIL_ANALYSIS_PROMPT},
+                {"role": "system", "content": build_email_analysis_prompt()},
                 {"role": "user", "content": content},
             ],
             max_tokens=400,
