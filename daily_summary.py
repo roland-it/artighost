@@ -194,14 +194,23 @@ def mark_as_read(message_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def build_email_analysis_prompt() -> str:
-    from datetime import date, timedelta
-    from zoneinfo import ZoneInfo
+    from datetime import timedelta
     eastern = ZoneInfo("America/New_York")
-    from datetime import datetime
     today = datetime.now(eastern).date()
     yesterday = today - timedelta(days=1)
     today_str = today.strftime("%A, %B %d, %Y")
     yesterday_str = yesterday.strftime("%A, %B %d, %Y")
+
+    # Compute date check instruction in Python — no ambiguity for the model
+    # weekday(): Monday=0, Tuesday=1, ..., Saturday=5, Sunday=6
+    if yesterday.weekday() == 6: #Sunday only
+        date_check_instruction = "Skip this check entirely — yesterday was a weekend day. Do not flag anything date-related."
+    else:
+        date_check_instruction = (
+            f"Flag if yesterday's date ({yesterday_str}) does not appear in a list of dates in the image. "
+            f"Only apply this check if the email explicitly contains a list or table of dates. "
+            f"If no date list is present in the image, skip this check."
+        )
 
     return f"""
 You are analyzing a monitoring email received by the IT team at Roland Foods.
@@ -209,11 +218,12 @@ You are analyzing a monitoring email received by the IT team at Roland Foods.
 Today is {today_str}. Yesterday was {yesterday_str}.
 
 Roland Foods receives these types of monitoring emails:
+- Profit loss data update statements: These are not spam, do not ignore them. Number of vouchers should match. Flag if they do not.
 - Financial/operational reports with numerical data in images. Perform TWO independent checks:
-  1. NUMBER CHECK: The image contains two tables stacked vertically, each with two columns of numbers and a grand total row at the bottom. Compare the grand total in the LEFT column of the TOP table against the highlighted total in the LEFT column of the BOTTOM table. If they differ by more than 1,000, flag as warning and include both numbers in your summary.
-  2. DATE CHECK: Flag if yesterday's date ({yesterday_str}) does not appear in a list of dates in the image, unless yesterday was a Saturday or Sunday. Only apply this check if the email explicitly contains a list or table of dates.
+  1. NUMBER CHECK: The image contains two tables stacked vertically, each with two columns of numbers and a grand total row at the bottom. Compare the grand total in the LEFT column of the TOP table against the grand total in the LEFT column of the BOTTOM table. If they differ by more than 1000, flag as warning and include both numbers in your summary.
+  2. DATE CHECK: {date_check_instruction}
   Both checks must pass independently for status to be "ok". Include the actual numbers you read from the image in your summary.
-- Order mismatch reports showing tabular data of orders needing correction. State exact count or confirm zero.
+- Order mismatch reports showing tabular data of orders needing correction. If the table is empty or shows no data, confirm zero mismatches. If orders are present, state the exact count. Never say the count is unclear — if you cannot read a number, state zero.
 - Process/job failure alerts. Summarize what failed and any available context.
 - General system status updates.
 - Spam or non-IT-relevant content.
@@ -244,7 +254,6 @@ def analyze_email(email: dict, images: list) -> dict:
         f"Preview: {preview}"
     )
 
-    # Build content with images if available
     if images:
         content = [{"type": "text", "text": text}]
         for img in images:
@@ -379,7 +388,6 @@ def run(test_mode: bool = False) -> None:
         log.info("No emails — posted empty briefing.")
         return
 
-    # Analyze each email individually with vision
     analyses = []
     for email in emails:
         log.info(f"Analyzing: {email.get('subject', '(no subject)')}")
@@ -392,7 +400,6 @@ def run(test_mode: bool = False) -> None:
     briefing = generate_briefing(analyses, ignored_count, date_str)
     post_to_slack(briefing)
 
-    # Mark all as read
     for email in emails:
         try:
             mark_as_read(email["id"])
