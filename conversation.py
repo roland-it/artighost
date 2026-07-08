@@ -263,10 +263,10 @@ def handle_message(
 
 def _call_openai(messages: list):
     return client.chat.completions.create(
-        model="gpt-4o-1",
+        model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.4"),
         messages=messages,
         tools=TOOLS,
         tool_choice="auto",
-        max_tokens=1000,
+        max_completion_tokens=1000,
         temperature=0.3,
     )
