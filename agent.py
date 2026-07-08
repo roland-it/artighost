@@ -54,16 +54,19 @@ def on_dm(message, say, client):
     user = message["user"]
     text = message.get("text", "")
     channel = message["channel"]
-    thread_ts = message.get("thread_ts") or message["ts"]
+    # DMs are flat, not threaded — only pass a real thread_ts if the user
+    # actually replied in a thread (rare in DMs); otherwise None so
+    # _build_messages pulls flat channel history instead.
+    thread_ts = message.get("thread_ts")
     log.info(f"DM from {user}: {text}")
     # Admin training commands
     if text.startswith("!") and is_admin(user):
         response = handle_admin_command(text[1:].strip())
-        say(text=response, thread_ts=thread_ts)
+        say(text=response)
         return
     # Block admin commands from non-admins silently degrading to chat
     if text.startswith("!") and not is_admin(user):
-        say(text="Sorry, that command isn't available.", thread_ts=thread_ts)
+        say(text="Sorry, that command isn't available.")
         return
     response = handle_message(
         user_id=user,
@@ -73,7 +76,7 @@ def on_dm(message, say, client):
         client=client,
         is_admin=is_admin(user),
     )
-    say(text=response, thread_ts=thread_ts)
+    say(text=response)
 
 
 @app.event("message")
