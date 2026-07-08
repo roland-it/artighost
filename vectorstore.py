@@ -6,7 +6,13 @@ Collections:
   rules       — learned behavior rules with training/live mode
   knowledge   — runbooks, KB articles (future: SharePoint sync)
 
-Embeddings are generated via Azure OpenAI (text-embedding-3-small).
+Embeddings are generated via a separate Azure OpenAI resource
+(text-embedding-3-small), distinct from the chat deployment (gpt-5.4)
+used elsewhere. The embedding model is deployed on the bare resource
+endpoint (https://paulc-admin-5015-resource.services.ai.azure.com),
+not the /v1/ project endpoint used for chat — hence the separate
+AzureOpenAI client and AZURE_OPENAI_EMBED_ENDPOINT env var below.
+
 ChromaDB persists to disk at CHROMA_PATH (default: ./chroma_db).
 """
 
@@ -19,16 +25,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import chromadb
-from openai import OpenAI
+from openai import AzureOpenAI
 
 log = logging.getLogger(__name__)
 
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "./chroma_db")
 EMBEDDING_MODEL = "text-embedding-3-small"
 
-_embed_client = OpenAI(
-    base_url=os.environ["AZURE_OPENAI_ENDPOINT"],
+_embed_client = AzureOpenAI(
+    azure_endpoint=os.environ["AZURE_OPENAI_EMBED_ENDPOINT"],
     api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    api_version="2024-02-01",
 )
 
 
