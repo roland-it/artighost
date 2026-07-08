@@ -20,7 +20,7 @@ load_dotenv()
 
 from openai import OpenAI
 from config import load_config
-from vectorstore import find_relevant_rules
+from vectorstore import find_relevant_rules, search_knowledge
 from freshservice import create_ticket
 
 log = logging.getLogger(__name__)
@@ -52,6 +52,10 @@ When helping a user with an IT issue in conversation:
   what the user reported and what troubleshooting has already been tried (so a human
   doesn't repeat steps). Do not call create_ticket for simple questions you can just answer.
 - After creating a ticket, tell the user the ticket number and that IT will follow up.
+
+If the user's message describes a new, unrelated issue from what was previously
+discussed, treat it as a new incident — do not conflate it with earlier
+troubleshooting or assume it continues the prior topic.
 """.strip()
 
 
@@ -245,6 +249,14 @@ def build_system_prompt(text: str, is_admin: bool) -> tuple[str, str]:
         for r in config.get("rules", []):
             sections.append(f"## Rules\n- {r}")
 
+    try:
+        knowledge = search_knowledge(text, n=3, threshold=0.15)
+        if knowledge:
+            kb_lines = [f"- [{k['title']}] {k['text'][:300]}" for k in knowledge]
+            sections.append("## Relevant Playbook Guidance\n" + "\n".join(kb_lines))
+    except Exception as e:
+        log.warning(f"Could not retrieve knowledge from ChromaDB: {e}")
+
     config = load_config()
     instructions = config.get("instructions", [])
     if instructions:
@@ -264,22 +276,33 @@ def _build_messages(
     prompt, rule_mode = build_system_prompt(text, is_admin)
     messages = [{"role": "system", "content": prompt}]
 
-    # Thread history (Slack only)
-    if slack_client and channel and thread_ts and channel != "email":
+    # History — DMs are flat (not threaded), so pull recent channel history
+    # in chronological order rather than a specific thread's replies.
+    # Non-DM channels (mentions) still use thread replies.
+    if slack_client and channel and channel != "email":
         try:
-            history = slack_client.conversations_replies(
-                channel=channel,
-                ts=thread_ts,
-                limit=10,
-            )
+            if thread_ts:
+                history = slack_client.conversations_replies(
+                    channel=channel,
+                    ts=thread_ts,
+                    limit=10,
+                )
+                msgs = history.get("messages", [])[:-1]
+            else:
+                history = slack_client.conversations_history(
+                    channel=channel,
+                    limit=15,
+                )
+                msgs = list(reversed(history.get("messages", [])))[:-1]
+
             bot_id = slack_client.auth_test()["user_id"]
-            for msg in history.get("messages", [])[:-1]:
+            for msg in msgs:
                 role = "assistant" if msg.get("user") == bot_id else "user"
                 content = msg.get("text", "")
                 if content:
                     messages.append({"role": role, "content": content})
         except Exception as e:
-            log.warning(f"Could not fetch thread history: {e}")
+            log.warning(f"Could not fetch conversation history: {e}")
 
     # Build user message — text + optional images
     if images:
