@@ -21,6 +21,7 @@ load_dotenv()
 from openai import OpenAI
 from config import load_config
 from vectorstore import find_relevant_rules
+from freshservice import create_ticket
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,15 @@ Do not ask for confirmation before sending.
 
 If an email contains images, analyze them as part of your assessment.
 Apply any relevant instructions about image content before deciding on urgency.
+
+When helping a user with an IT issue in conversation:
+- Try to resolve it through troubleshooting steps first.
+- Only call create_ticket if you cannot resolve the issue after reasonable troubleshooting,
+  or if the request clearly requires human action (e.g. account provisioning, hardware, approvals).
+- Before calling create_ticket, write a clear subject and a description that includes
+  what the user reported and what troubleshooting has already been tried (so a human
+  doesn't repeat steps). Do not call create_ticket for simple questions you can just answer.
+- After creating a ticket, tell the user the ticket number and that IT will follow up.
 """.strip()
 
 
@@ -76,6 +86,37 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_ticket",
+            "description": (
+                "Create a FreshService IT support ticket. Use this only when you cannot "
+                "resolve the user's issue through conversation, or the request requires "
+                "human action. Not for simple questions you can answer directly. "
+                "Category and group assignment are not yet automated — tickets land "
+                "unclassified for manual triage."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "Short, specific ticket subject line.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Clear description of the issue: what the user reported, "
+                            "what troubleshooting was already tried and its result, "
+                            "and any other relevant detail a human would need."
+                        ),
+                    },
+                },
+                "required": ["subject", "description"],
+            },
+        },
+    },
 ]
 
 
@@ -83,12 +124,18 @@ TOOLS = [
 # Tool execution
 # ---------------------------------------------------------------------------
 
-def execute_tool(name: str, arguments: dict, is_admin: bool, rule_mode: str = "training") -> str:
+def execute_tool(name: str, arguments: dict, is_admin: bool, rule_mode: str = "training", requester_email: str = None) -> str:
     if name == "send_slack_alert":
         return _tool_send_slack_alert(
             message=arguments["message"],
             urgency=arguments.get("urgency", "medium"),
             rule_mode=rule_mode,
+        )
+    if name == "create_ticket":
+        return _tool_create_ticket(
+            subject=arguments["subject"],
+            description=arguments["description"],
+            requester_email=requester_email,
         )
     return f"Unknown tool: {name}"
 
@@ -121,6 +168,43 @@ def _tool_send_slack_alert(message: str, urgency: str, rule_mode: str = "trainin
     except SlackApiError as e:
         log.error(f"Slack alert failed: {e}")
         return f"Failed to send alert: {e.response['error']}"
+
+
+def _tool_create_ticket(subject: str, description: str, requester_email: str = None) -> str:
+    if not requester_email:
+        log.warning("create_ticket called without a resolvable requester email.")
+        return (
+            "Could not create the ticket — no email address on file for this user. "
+            "Ask them to email IT directly, or open the ticket manually."
+        )
+
+    try:
+        ticket = create_ticket(
+            subject=subject,
+            description=description,
+            requester_email=requester_email,
+        )
+        ticket_id = ticket.get("id")
+        return f"Ticket #{ticket_id} created successfully."
+    except Exception as e:
+        log.error(f"Ticket creation failed: {e}")
+        return "Failed to create the ticket — let the user know to contact IT directly."
+
+
+# ---------------------------------------------------------------------------
+# Slack user → email lookup
+# ---------------------------------------------------------------------------
+
+def _get_user_email(user_id: str, slack_client) -> str | None:
+    """Look up a Slack user's email via users.info. Returns None if unavailable."""
+    if not slack_client or not user_id:
+        return None
+    try:
+        result = slack_client.users_info(user=user_id)
+        return result.get("user", {}).get("profile", {}).get("email")
+    except Exception as e:
+        log.warning(f"Could not look up email for Slack user {user_id}: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +313,7 @@ def handle_message(
     images: list = None,
 ) -> str:
     messages, rule_mode = _build_messages(text, thread_ts, channel, client, is_admin, images)
+    requester_email = _get_user_email(user_id, client)
 
     try:
         response = _call_openai(messages)
@@ -242,7 +327,13 @@ def handle_message(
                 arguments = json.loads(tool_call.function.arguments)
 
                 log.info(f"Tool call: {name}({arguments}) [mode={rule_mode}]")
-                result = execute_tool(name, arguments, is_admin, rule_mode=rule_mode)
+                result = execute_tool(
+                    name,
+                    arguments,
+                    is_admin,
+                    rule_mode=rule_mode,
+                    requester_email=requester_email,
+                )
                 log.info(f"Tool result: {result}")
 
                 messages.append({
