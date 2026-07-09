@@ -3,7 +3,9 @@ IT Helper Agent — Slack Bolt + Azure OpenAI
 Entry point. Run with: python agent.py
 """
 import os
+import base64
 import logging
+import requests
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
@@ -23,6 +25,34 @@ ADMIN_CHANNEL = os.environ.get("ADMIN_CHANNEL_ID")
 active_threads = set()
 
 
+def _extract_images(files: list) -> list:
+    """Download image files from a Slack message. Returns list of
+    {mime_type, data} dicts ready for GPT vision input. Non-images skipped."""
+    if not files:
+        return []
+    images = []
+    token = os.environ["SLACK_BOT_TOKEN"]
+    for f in files:
+        mime = f.get("mimetype", "")
+        if not mime.startswith("image/"):
+            log.info(f"Skipping non-image file: {f.get('name')} ({mime})")
+            continue
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            continue
+        try:
+            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+            resp.raise_for_status()
+            images.append({
+                "mime_type": mime,
+                "data": base64.b64encode(resp.content).decode("utf-8"),
+            })
+            log.info(f"Downloaded image: {f.get('name')} ({len(resp.content)} bytes)")
+        except Exception as e:
+            log.warning(f"Could not download Slack file {f.get('name')}: {e}")
+    return images
+
+
 @app.event("app_mention")
 def on_mention(event, say, client):
     """Agent responds when mentioned in any channel."""
@@ -35,6 +65,7 @@ def on_mention(event, say, client):
     clean_text = " ".join(
         word for word in text.split() if not word.startswith("<@")
     ).strip()
+    images = _extract_images(event.get("files") or [])
     response = handle_message(
         user_id=user,
         text=clean_text,
@@ -42,6 +73,7 @@ def on_mention(event, say, client):
         thread_ts=thread_ts,
         client=client,
         is_admin=is_admin(user),
+        images=images,
     )
     say(text=response, thread_ts=thread_ts)
 
@@ -68,6 +100,7 @@ def on_dm(message, say, client):
     if text.startswith("!") and not is_admin(user):
         say(text="Sorry, that command isn't available.")
         return
+    images = _extract_images(message.get("files") or [])
     response = handle_message(
         user_id=user,
         text=text,
@@ -75,6 +108,7 @@ def on_dm(message, say, client):
         thread_ts=thread_ts,
         client=client,
         is_admin=is_admin(user),
+        images=images,
     )
     say(text=response)
 
@@ -100,6 +134,7 @@ def on_thread_reply(message, say, client):
     channel = message["channel"]
     log.info(f"Thread reply from {user} in {channel}: {text}")
 
+    images = _extract_images(message.get("files") or [])
     response = handle_message(
         user_id=user,
         text=text,
@@ -107,6 +142,7 @@ def on_thread_reply(message, say, client):
         thread_ts=thread_ts,
         client=client,
         is_admin=is_admin(user),
+        images=images,
     )
     say(text=response, thread_ts=thread_ts)
 
