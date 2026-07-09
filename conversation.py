@@ -306,7 +306,8 @@ def _build_messages(
 
     # Build user message — text + optional images
     if images:
-        content = [{"type": "text", "text": text}]
+        prompt_text = text if text.strip() else "The user sent this image without a caption. Describe what you see and ask what they need help with."
+        content = [{"type": "text", "text": prompt_text}]
         for img in images:
             content.append({
                 "type": "image_url",
