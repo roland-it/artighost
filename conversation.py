@@ -3,12 +3,10 @@ Conversation handler.
 Builds the prompt, calls Azure OpenAI with function calling,
 executes tool calls, and returns a response string.
 
-Supports vision — images passed from the email poller are included
-as base64 content blocks in the user message.
-
-Alert routing:
-  - No matching rule or training mode → TRAINING_CHANNEL_ID
-  - Live mode rule matched           → LIVE_CHANNEL_ID
+Currently supports one tool: create_ticket (FreshService).
+Email/alert handling has been removed — email is now handled entirely
+by daily_summary.py and early_alert_check.py on a schedule; there is
+no in-conversation email flow.
 """
 
 import os
@@ -37,13 +35,6 @@ You have access to tools and should use them when appropriate.
 Be concise and direct. When you're unsure, say so — don't guess.
 If asked to do something you cannot do, say so clearly and suggest contacting IT directly.
 
-When you receive an email notification, always call send_slack_alert.
-Include a one-line summary of the email and the sender in the alert message.
-Do not ask for confirmation before sending.
-
-If an email contains images, analyze them as part of your assessment.
-Apply any relevant instructions about image content before deciding on urgency.
-
 When helping a user with an IT issue in conversation:
 - Try to resolve it through troubleshooting steps first.
 - Only call create_ticket if you cannot resolve the issue after reasonable troubleshooting,
@@ -56,6 +47,17 @@ When helping a user with an IT issue in conversation:
 If the user's message describes a new, unrelated issue from what was previously
 discussed, treat it as a new incident — do not conflate it with earlier
 troubleshooting or assume it continues the prior topic.
+
+Format your responses for Slack, not for a Markdown document:
+- Keep responses short. If a full answer would be long, give the 2-3 most important
+  next steps and offer to go deeper if needed. Do not dump entire runbooks unprompted.
+- Use *single asterisks* for bold, not **double asterisks** — Slack renders double
+  asterisks as literal characters.
+- Do not use Markdown headers like # or ###. If you need a section break, use a
+  short bolded phrase on its own line.
+- Prefer short flat bulleted lists. Avoid nesting bullets more than one level.
+- Do not repeat the same recommendation across multiple sections.
+- No closing summary or "let me know if..." lines unless genuinely useful.
 """.strip()
 
 
@@ -64,32 +66,6 @@ troubleshooting or assume it continues the prior topic.
 # ---------------------------------------------------------------------------
 
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "send_slack_alert",
-            "description": (
-                "Send an alert message about an email or request. "
-                "Always call this when processing an email. "
-                "The channel is determined automatically based on rule mode."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Concise alert — sender, subject, one-line summary.",
-                    },
-                    "urgency": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "description": "Urgency level.",
-                    },
-                },
-                "required": ["message", "urgency"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -128,13 +104,7 @@ TOOLS = [
 # Tool execution
 # ---------------------------------------------------------------------------
 
-def execute_tool(name: str, arguments: dict, is_admin: bool, rule_mode: str = "training", requester_email: str = None) -> str:
-    if name == "send_slack_alert":
-        return _tool_send_slack_alert(
-            message=arguments["message"],
-            urgency=arguments.get("urgency", "medium"),
-            rule_mode=rule_mode,
-        )
+def execute_tool(name: str, arguments: dict, is_admin: bool, requester_email: str = None) -> str:
     if name == "create_ticket":
         return _tool_create_ticket(
             subject=arguments["subject"],
@@ -142,36 +112,6 @@ def execute_tool(name: str, arguments: dict, is_admin: bool, rule_mode: str = "t
             requester_email=requester_email,
         )
     return f"Unknown tool: {name}"
-
-
-def _tool_send_slack_alert(message: str, urgency: str, rule_mode: str = "training") -> str:
-    from slack_sdk import WebClient
-    from slack_sdk.errors import SlackApiError
-
-    if rule_mode == "live":
-        channel = os.environ.get("LIVE_CHANNEL_ID")
-        if not channel:
-            log.warning("LIVE_CHANNEL_ID not set — falling back to training channel.")
-            channel = os.environ.get("TRAINING_CHANNEL_ID")
-    else:
-        channel = os.environ.get("TRAINING_CHANNEL_ID")
-
-    if not channel:
-        log.warning("No alert channel configured.")
-        return "No alert channel configured."
-
-    urgency_emoji = {"low": "🟡", "medium": "🟠", "high": "🔴"}.get(urgency, "🟠")
-    mode_tag = "🎓 *Training*" if rule_mode == "training" else "🔴 *Live*"
-    full_message = f"{urgency_emoji} {mode_tag} [{urgency.upper()}]\n{message}"
-
-    try:
-        slack = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
-        slack.chat_postMessage(channel=channel, text=full_message)
-        log.info(f"Alert sent to {rule_mode} channel: {message}")
-        return f"Alert sent to {rule_mode} channel ({urgency} urgency)."
-    except SlackApiError as e:
-        log.error(f"Slack alert failed: {e}")
-        return f"Failed to send alert: {e.response['error']}"
 
 
 def _tool_create_ticket(subject: str, description: str, requester_email: str = None) -> str:
@@ -215,7 +155,7 @@ def _get_user_email(user_id: str, slack_client) -> str | None:
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-def build_system_prompt(text: str, is_admin: bool) -> tuple[str, str]:
+def build_system_prompt(text: str, is_admin: bool) -> str:
     sections = [BASE_SYSTEM_PROMPT]
 
     if is_admin:
@@ -227,20 +167,15 @@ def build_system_prompt(text: str, is_admin: bool) -> tuple[str, str]:
             "Do not perform admin-only actions."
         )
 
-    rule_mode = "training"
     try:
         rules = find_relevant_rules(text, n=5)
         if rules:
-            if any(r.get("mode") == "live" for r in rules):
-                rule_mode = "live"
             rule_lines = []
             for r in rules:
                 pattern = r.get("pattern", "")
                 note = r.get("note", "")
-                mode = r.get("mode", "training")
                 rule_lines.append(
-                    f"- [{mode.upper()}] {pattern}" +
-                    (f" ({note})" if note and note != pattern else "")
+                    f"- {pattern}" + (f" ({note})" if note and note != pattern else "")
                 )
             sections.append("## Relevant Rules\n" + "\n".join(rule_lines))
     except Exception as e:
@@ -262,7 +197,7 @@ def build_system_prompt(text: str, is_admin: bool) -> tuple[str, str]:
     if instructions:
         sections.append("## Instructions\n" + "\n".join(f"- {i}" for i in instructions))
 
-    return "\n\n".join(sections), rule_mode
+    return "\n\n".join(sections)
 
 
 def _build_messages(
@@ -272,8 +207,8 @@ def _build_messages(
     slack_client,
     is_admin: bool,
     images: list = None,
-) -> tuple[list, str]:
-    prompt, rule_mode = build_system_prompt(text, is_admin)
+) -> list:
+    prompt = build_system_prompt(text, is_admin)
     messages = [{"role": "system", "content": prompt}]
 
     # History — DMs are flat (not threaded), so pull recent channel history
@@ -306,8 +241,7 @@ def _build_messages(
 
     # Build user message — text + optional images
     if images:
-        prompt_text = text if text.strip() else "The user sent this image without a caption. Describe what you see and ask what they need help with."
-        content = [{"type": "text", "text": prompt_text}]
+        content = [{"type": "text", "text": text}]
         for img in images:
             content.append({
                 "type": "image_url",
@@ -320,7 +254,7 @@ def _build_messages(
     else:
         messages.append({"role": "user", "content": text})
 
-    return messages, rule_mode
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +270,7 @@ def handle_message(
     is_admin: bool = False,
     images: list = None,
 ) -> str:
-    messages, rule_mode = _build_messages(text, thread_ts, channel, client, is_admin, images)
+    messages = _build_messages(text, thread_ts, channel, client, is_admin, images)
     requester_email = _get_user_email(user_id, client)
 
     try:
@@ -350,12 +284,11 @@ def handle_message(
                 name = tool_call.function.name
                 arguments = json.loads(tool_call.function.arguments)
 
-                log.info(f"Tool call: {name}({arguments}) [mode={rule_mode}]")
+                log.info(f"Tool call: {name}({arguments})")
                 result = execute_tool(
                     name,
                     arguments,
                     is_admin,
-                    rule_mode=rule_mode,
                     requester_email=requester_email,
                 )
                 log.info(f"Tool result: {result}")
@@ -382,6 +315,6 @@ def _call_openai(messages: list):
         messages=messages,
         tools=TOOLS,
         tool_choice="auto",
-        max_completion_tokens=1000,
+        max_completion_tokens=500,
         temperature=0.3,
     )
