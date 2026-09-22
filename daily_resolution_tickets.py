@@ -2,7 +2,7 @@
 Daily RESOLVED BY BOT ticket creation.
 
 Runs once a day (target: 8 PM Eastern via Rundeck).
-Scans all DM conversations Artighost had today, groups messages by topic
+Scans all DM conversations Chip had today, groups messages by topic
 via GPT, and creates one FreshService ticket per detected topic per user —
 subject prefixed with "RESOLVED BY BOT".
 
@@ -295,7 +295,7 @@ def topic_matches_existing(new_subject: str, new_transcript: str, existing_recor
 
 GROUPING_PROMPT = """
 You are analyzing a day's worth of chat messages between a user and an IT
-helper bot (Artighost). Group the messages into distinct issues/topics,
+helper bot (Chip). Group the messages into distinct issues/topics,
 and classify each group as an INCIDENT or a PROJECT.
 
 - INCIDENT: something broken, not working, access request, error, existing-
@@ -374,7 +374,7 @@ def format_transcript(messages: list[dict], indices: list[int]) -> str:
         if i >= len(messages):
             continue
         m = messages[i]
-        speaker = "Artighost" if m["role"] == "assistant" else "User"
+        speaker = "Chip" if m["role"] == "assistant" else "User"
         ts_str = datetime.fromtimestamp(m["ts"], tz=EASTERN).strftime("%I:%M %p")
         # basic HTML escape for the message text
         safe_text = (m["text"]
@@ -493,7 +493,7 @@ def run(test_mode: bool = False) -> None:
 
     if DRY_RUN:
         if dry_run_drafts:
-            email_subject = f"[DRY RUN] Artighost — {len(dry_run_drafts)} RESOLVED BY BOT ticket(s) would have been created ({day_eastern.isoformat()})"
+            email_subject = f"[DRY RUN] Chip — {len(dry_run_drafts)} RESOLVED BY BOT ticket(s) would have been created ({day_eastern.isoformat()})"
             sections = [
                 f"<p>Dry run only. No FreshService tickets were created. "
                 f"{len(dry_run_drafts)} would have been.</p>",
