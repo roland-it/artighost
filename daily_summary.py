@@ -350,7 +350,7 @@ def analyze_email(email: dict, images: list) -> dict:
 # ---------------------------------------------------------------------------
 
 BRIEFING_PROMPT = """
-You are Artighost, an IT helper agent for Roland Foods.
+You are Chip, an IT helper agent for Roland Foods.
 Generate a brief morning IT briefing from the analyzed emails below. Be concise — short bullets, no repeated numbers across sections, no restating the same fact twice.
 
 Format:
@@ -483,7 +483,7 @@ def run(test_mode: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Artighost Daily Summary")
+    parser = argparse.ArgumentParser(description="Chip Daily Summary")
     parser.add_argument("--now", action="store_true", help="Run immediately using last 8 hours")
     args = parser.parse_args()
     run(test_mode=args.now)
