@@ -135,6 +135,34 @@ def fetch_emails_in_window(since: datetime, until: datetime) -> list:
     return emails
 
 
+def profit_loss_email_exists_in_window(since: datetime, until: datetime) -> bool:
+    """
+    Dedicated presence check for the Profit Loss email, independent of read state.
+    The early alert check may have already read other emails in this window,
+    so the main unread-only fetch can't be trusted for this specific check.
+    """
+    mailbox = os.environ["AGENT_EMAIL"]
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_str = until.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    data = graph_get(
+        f"/users/{mailbox}/mailFolders/inbox/messages",
+        params={
+            "$filter": (
+                f"receivedDateTime ge {since_str} "
+                f"and receivedDateTime le {until_str} "
+                f"and subject eq 'Profit Loss Data Update Statement'"
+            ),
+            "$top": 1,
+            "$select": "id,subject",
+        },
+    )
+
+    found = len(data.get("value", [])) > 0
+    log.info(f"Profit Loss email presence check (read-state independent): {'FOUND' if found else 'NOT FOUND'}")
+    return found
+
+
 def extract_inline_images(email: dict) -> list[dict]:
     """Extract inline images from email HTML body. Returns list of {data, mime_type}."""
     images = []
@@ -201,15 +229,23 @@ def build_email_analysis_prompt() -> str:
     today_str = today.strftime("%A, %B %d, %Y")
     yesterday_str = yesterday.strftime("%A, %B %d, %Y")
 
-    # Compute date check instruction in Python — no ambiguity for the model
+    # Compute date check instructions in Python — no ambiguity for the model
     # weekday(): Monday=0, Tuesday=1, ..., Saturday=5, Sunday=6
-    if yesterday.weekday() == 6: #Sunday only
-        date_check_instruction = "Skip this check entirely — yesterday was a weekend day. Do not flag anything date-related."
+    if yesterday.weekday() >= 5:
+        pnl_date_check = "Skip this check entirely — yesterday was a weekend day. Do not flag anything date-related."
+        ship_date_check = "Skip this check entirely — yesterday was a weekend day. Do not flag anything date-related."
     else:
-        date_check_instruction = (
-            f"Flag if yesterday's date ({yesterday_str}) does not appear in a list of dates in the image. "
-            f"Only apply this check if the email explicitly contains a list or table of dates. "
-            f"If no date list is present in the image, skip this check."
+        pnl_date_check = (
+            f"The table called \"PnL Entry Date\" lists calendar dates. "
+            f"Check whether {yesterday_str} is present anywhere in that list — yes or no. "
+            f"Do not assume anything about its position (first, last, or otherwise). "
+            f"If it is not present, flag this check as failed."
+        )
+        ship_date_check = (
+            f"The table called \"Cases Ship - Invoice Date\" lists calendar dates. "
+            f"Check whether {yesterday_str} is present anywhere in that list — yes or no. "
+            f"Do not assume anything about its position (first, last, or otherwise). "
+            f"If it is not present, flag this check as failed."
         )
 
     return f"""
@@ -218,19 +254,19 @@ You are analyzing a monitoring email received by the IT team at Roland Foods.
 Today is {today_str}. Yesterday was {yesterday_str}.
 
 Roland Foods receives these types of monitoring emails:
-- Profit loss data update statements: These are not spam, do not ignore them. Number of vouchers should match. Flag if they do not.
-- Financial/operational reports with numerical data in images. Perform TWO independent checks:
-  1. NUMBER CHECK: The image contains two tables stacked vertically, each with two columns of numbers and a grand total row at the bottom. Compare the grand total in the LEFT column of the TOP table against the grand total in the LEFT column of the BOTTOM table. If they differ by more than 1000, flag as warning and include both numbers in your summary.
-  2. DATE CHECK: {date_check_instruction}
-  Both checks must pass independently for status to be "ok". Include the actual numbers you read from the image in your summary.
-- Order mismatch reports showing tabular data of orders needing correction. If the table is empty or shows no data, confirm zero mismatches. If orders are present, state the exact count. Never say the count is unclear — if you cannot read a number, state zero.
+- Profit Loss Data Update Statement: This email has the exact subject "Profit Loss Data Update Statement". It is not spam, do not ignore it. In the body of the email, the number of vouchers will be mentioned twice. These numbers should match. Flag if they do not match.
+- Last date in Tableau Extracts report. Perform THREE independent checks:
+  1. NUMBER CHECK: The image contains two tables stacked vertically called "PnL Entry Date" and "Cases Ship - Invoice Date". Compare the "PnL Entra Date" Grand Total amount against the "Cases Ship - Invoice Date" Grand Total amount. If they differ by MORE THAN 1,000 (i.e. the difference exceeds 1,000), flag as warning. A difference of 1,001 or more is a flag. A difference of 1,000 or less is acceptable.
+  2. PNL ENTRY DATE CHECK: {pnl_date_check}
+  3. CASES SHIP INVOICE DATE CHECK: {ship_date_check}
+  All three checks must pass independently for status to be "ok". Include the actual numbers you read from the image in your summary, and state clearly which of the three checks passed or failed.
 - Process/job failure alerts. Summarize what failed and any available context.
 - General system status updates.
 - Spam or non-IT-relevant content.
 
 Analyze the email including any images. Respond with JSON only:
 {{
-  "classification": "financial_report|order_mismatch|process_failure|system_status|ignore",
+  "classification": "profit_loss|financial_report|process_failure|system_status|ignore",
   "status": "ok|warning|error|ignore",
   "summary": "one or two sentence factual summary with specific numbers from images where available",
   "action_required": true/false,
@@ -246,12 +282,25 @@ def analyze_email(email: dict, images: list) -> dict:
     """Analyze a single email with vision. Returns analysis dict."""
     sender = email.get("from", {}).get("emailAddress", {})
     subject = email.get("subject", "(no subject)")
-    preview = email.get("bodyPreview", "")[:500]
+
+    # Use full body content, not just the 255-char preview
+    body_content = email.get("body", {}).get("content", "")
+    body_type = email.get("body", {}).get("contentType", "text")
+
+    if body_type.lower() == "html":
+        # Strip HTML tags to get readable text, keep it reasonably sized
+        soup = BeautifulSoup(body_content, "html.parser")
+        body_text = soup.get_text(separator="\n").strip()
+    else:
+        body_text = body_content.strip()
+
+    # Cap length to avoid excessive token usage, but much larger than the old 500-char preview
+    body_text = body_text[:5000]
 
     text = (
         f"From: {sender.get('address', 'unknown')}\n"
         f"Subject: {subject}\n"
-        f"Preview: {preview}"
+        f"Body:\n{body_text}"
     )
 
     if images:
@@ -269,12 +318,12 @@ def analyze_email(email: dict, images: list) -> dict:
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-1",
+            model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-1"),
             messages=[
                 {"role": "system", "content": build_email_analysis_prompt()},
                 {"role": "user", "content": content},
             ],
-            max_tokens=400,
+            max_completion_tokens=400,
             temperature=0,
         )
         raw = response.choices[0].message.content.strip()
@@ -302,36 +351,48 @@ def analyze_email(email: dict, images: list) -> dict:
 
 BRIEFING_PROMPT = """
 You are Artighost, an IT helper agent for Roland Foods.
-Generate a concise morning IT briefing from the analyzed emails below.
+Generate a brief morning IT briefing from the analyzed emails below. Be concise — short bullets, no repeated numbers across sections, no restating the same fact twice.
 
 Format:
-*Overall:* one sentence health assessment (use ✅ if all clear, ⚠️ if warnings, 🔴 if errors)
+*Overall:* one short sentence (✅ all clear, ⚠️ warnings, 🔴 critical — use 🔴 if a critical pipeline issue was flagged, even if other items are minor)
 
 *Financial Reports:*
-- List each with specific numbers and whether they match or flag discrepancy
-
-*Order Mismatches:*
-- State count or confirm clean
+- One short bullet per report. State numbers once. If a check failed, say which check and why, briefly.
 
 *Process Failures:*
-- Summarize each failure
+- One short bullet per failure.
 
 *Action Required:*
-- List items or state "None"
+- Short list, or "None"
 
 *Summary:* X emails analyzed, Y ignored
 
-Be specific and factual. Use the numbers and details from the analyses provided.
+Be factual and terse. Do not repeat the same number or fact in multiple sections.
 """.strip()
 
 
-def generate_briefing(analyses: list, ignored_count: int, date_str: str) -> str:
+def generate_briefing(analyses: list, ignored_count: int, date_str: str, profit_loss_received: bool) -> str:
     relevant = [a for a in analyses if a.get("classification") != "ignore"]
 
+    missing_pnl_flag = (
+        ""
+        if profit_loss_received
+        else "\n\nNOTE: No email with subject \"Profit Loss Data Update Statement\" was received in this window. "
+             "This is a CRITICAL issue — the Overall status must be 🔴 critical. "
+             "In Action Required, include: \"Profit Loss Data pipeline may be incomplete.\""
+    )
+
     if not relevant:
+        overall = "🔴 Critical" if not profit_loss_received else "✅ All clear"
+        pnl_line = (
+            "\n\n*Action Required:*\n- Profit Loss Data pipeline may be incomplete."
+            if not profit_loss_received else ""
+        )
         return (
             f"📋 *Morning IT Briefing* — {date_str}\n"
-            f"✅ No system monitoring emails received in the overnight window.\n"
+            f"*Overall:* {overall}\n"
+            f"No system monitoring emails received in the overnight window."
+            f"{pnl_line}\n"
             f"_{ignored_count} email(s) ignored as non-IT-relevant._"
         )
 
@@ -340,13 +401,13 @@ def generate_briefing(analyses: list, ignored_count: int, date_str: str) -> str:
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-1",
+            model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-1"),
             messages=[
                 {"role": "system", "content": BRIEFING_PROMPT},
-                {"role": "user", "content": f"Date: {date_str}\nAnalyses:\n{context}\nTotal: {total}, Ignored: {ignored_count}"},
+                {"role": "user", "content": f"Date: {date_str}\nAnalyses:\n{context}\nTotal: {total}, Ignored: {ignored_count}{missing_pnl_flag}"},
             ],
-            max_tokens=800,
-            temperature=0.3,
+            max_completion_tokens=600,
+            temperature=0.2,
         )
         body = response.choices[0].message.content.strip()
     except Exception as e:
@@ -380,12 +441,24 @@ def run(test_mode: bool = False) -> None:
     emails = fetch_emails_in_window(since, until)
     date_str = since.astimezone(EASTERN).strftime("%B %d, %Y")
 
+    # Independent of read state — catches the case where the early check
+    # already read the Profit Loss email before this run.
+    profit_loss_received = profit_loss_email_exists_in_window(since, until)
+    if not profit_loss_received:
+        log.warning("Profit Loss Data Update Statement email NOT found in this window.")
+
     if not emails:
+        overall = "🔴 Critical" if not profit_loss_received else "✅ All clear"
+        action = (
+            "\n\n*Action Required:*\n- Profit Loss Data pipeline may be incomplete."
+            if not profit_loss_received else ""
+        )
         post_to_slack(
             f"📋 *Morning IT Briefing* — {date_str}\n"
-            f"No unread emails in the monitoring window."
+            f"*Overall:* {overall}\n"
+            f"No unread emails in the monitoring window.{action}"
         )
-        log.info("No emails — posted empty briefing.")
+        log.info("No unread emails — posted briefing.")
         return
 
     analyses = []
@@ -397,7 +470,7 @@ def run(test_mode: bool = False) -> None:
         log.info(f"  → {analysis['classification']} | {analysis['status']} | {analysis['summary'][:80]}")
 
     ignored_count = sum(1 for a in analyses if a.get("classification") == "ignore")
-    briefing = generate_briefing(analyses, ignored_count, date_str)
+    briefing = generate_briefing(analyses, ignored_count, date_str, profit_loss_received)
     post_to_slack(briefing)
 
     for email in emails:
