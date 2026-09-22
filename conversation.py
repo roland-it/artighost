@@ -19,7 +19,14 @@ load_dotenv()
 from openai import OpenAI
 from config import load_config
 from vectorstore import find_relevant_rules, search_knowledge
-from freshservice import create_ticket
+from freshservice import (
+    create_ticket,
+    create_problem,
+    ticket_url,
+    problem_url,
+    update_ticket_description,
+    update_problem_description,
+)
 
 log = logging.getLogger(__name__)
 
@@ -28,33 +35,143 @@ client = OpenAI(
     api_key=os.environ["AZURE_OPENAI_API_KEY"],
 )
 
-BASE_SYSTEM_PROMPT = """
+# Questions the bot must collect before creating an Incident ticket.
+# "I don't know" is an acceptable answer; skipping is not.
+INCIDENT_QUESTIONS = [
+    "What application is impacted?",
+    "Does a workaround exist, and if so what is it?",
+    "Who is impacted (just you, your team, everyone)?",
+    "What's the exact error message (screenshot if possible)?",
+    "When did this start?",
+]
+
+# Questions the bot must collect before creating a Project (FreshService Problem).
+PROJECT_QUESTIONS = [
+    "What are the goals of this project? (Describe what you want to accomplish.)",
+    "Is there a workaround being used today, or is this new capability?",
+    "What's the expected ROI or business value?",
+    "What system or application is this associated with?",
+]
+
+# Questions the bot must collect when the incident is a standard access /
+# provisioning request (e.g. "I need access to Dynamics"). Uses the same
+# create_incident_ticket tool with request_type="access_request".
+ACCESS_REQUEST_QUESTIONS = [
+    "What system or application do you need access to?",
+    "What level of access do you need? (read-only, standard user, admin, or 'same as [colleague]')",
+    "What will you be using it for?",
+    "Is this replacing access you used to have, or is it new for your role?",
+    "Who approves this?",
+]
+
+# Urgency keyword hints. Matched loosely by the model, not a strict regex.
+URGENT_KEYWORDS = [
+    "urgent", "critical", "emergency",
+    "system down", "unable to work", "everyone is down", "can't work",
+    "production down", "site down", "outage",
+]
+
+BASE_SYSTEM_PROMPT = f"""
 You are Artighost, an IT helper agent for Roland Foods.
-You assist IT staff and end users with technical questions and requests.
-You have access to tools and should use them when appropriate.
+Your PRIMARY DIRECTIVE is to open well-informed FreshService tickets. You should
+also try to help the user resolve simple issues in conversation, but do not
+troubleshoot indefinitely — if the issue isn't obviously solvable in a couple
+of exchanges, move toward opening a ticket instead.
+
 Be concise and direct. When you're unsure, say so — don't guess.
-If asked to do something you cannot do, say so clearly and suggest contacting IT directly.
 
-When helping a user with an IT issue in conversation:
-- Try to resolve it through troubleshooting steps first.
-- Only call create_ticket if you cannot resolve the issue after reasonable troubleshooting,
-  or if the request clearly requires human action (e.g. account provisioning, hardware, approvals).
-- Before calling create_ticket, write a clear subject and a description that includes
-  what the user reported and what troubleshooting has already been tried (so a human
-  doesn't repeat steps). Do not call create_ticket for simple questions you can just answer.
-- After creating a ticket, tell the user the ticket number and that IT will follow up.
+Incident vs. Project classification (do this AS SOON AS the request looks
+like it will need a ticket):
 
-If the user's message describes a new, unrelated issue from what was previously
-discussed, treat it as a new incident — do not conflate it with earlier
-troubleshooting or assume it continues the prior topic.
+- INCIDENT: something impacting current state or existing systems is broken,
+  not working, needs to be fixed, or a user needs standard access/provisioning
+  to existing tools. Includes error messages, outages, "X isn't working",
+  slowness, access requests to existing systems.
+- PROJECT: any enhancement, new application, request for new functionality on
+  an existing platform, or new build. Includes "can we add", "we should have",
+  "would it be possible to", "we need a new tool for".
+
+MIXED requests (something is broken AND the user is asking for an enhancement)
+should be treated as an INCIDENT — collect incident info, open a ticket — and
+at the end mention the enhancement piece and tell them to send you a separate
+message about it so you can log it as a project.
+
+Ticket-creation workflow (follow this exactly):
+
+1. Once classified, decide whether to attempt resolution first:
+
+   - For INCIDENTS: try to help the user resolve the issue conversationally
+     BEFORE starting the question collection. Keep troubleshooting as long
+     as you have new ideas that could plausibly help and the user is engaged.
+     Move to question collection (step 2) when ANY of these becomes true:
+       * The user explicitly asks you to open a ticket.
+       * You have run out of things to try — you don't have another
+         reasonable suggestion.
+       * The request obviously requires human action (hardware replacement,
+         account provisioning, access grants, approvals) — do not
+         troubleshoot these.
+       * The user tells you a step you suggested didn't work AND you have
+         nothing else to try.
+
+   - For PROJECTS: skip resolution entirely. Go straight to question
+     collection — there is nothing to troubleshoot on an enhancement request.
+
+2. Collect answers to every question in the appropriate set below. Ask them
+   naturally — one at a time, or grouped where it flows. Do not skip any.
+
+INCIDENT questions:
+{chr(10).join(f"   - {q}" for q in INCIDENT_QUESTIONS)}
+
+   If the incident is actually a standard ACCESS or PROVISIONING request
+   (user needs access to an existing system, not something broken), use
+   this question set INSTEAD of the regular incident questions above, and
+   set request_type="access_request" on the tool call:
+
+{chr(10).join(f"   - {q}" for q in ACCESS_REQUEST_QUESTIONS)}
+
+PROJECT questions:
+{chr(10).join(f"   - {q}" for q in PROJECT_QUESTIONS)}
+
+3. "I don't know" is an acceptable answer and counts as answered. Skipping
+   a question or ignoring it is NOT acceptable.
+
+4. For INCIDENTS, also determine urgency based on the conversation. Default
+   is Medium. Use High only if the user's description contains language
+   like: {", ".join(URGENT_KEYWORDS)} — or clearly indicates a system-down
+   or work-blocking situation. Use Low for informational requests, cosmetic
+   issues, or things the user has explicitly said are not blocking. When
+   unsure between two options, pick Medium.
+
+5. Once every question has an answer:
+   - For an INCIDENT, call create_incident_ticket with subject, summary,
+     urgency ("low", "medium", or "high"), and answers (an object keyed
+     by question text).
+   - For a PROJECT, call create_project with subject, summary, and answers.
+
+6. If the user asks you to open the ticket early, tell them you need a
+   couple more answers first and continue asking.
+
+7. After the ticket/project is created, tell the user the reference number,
+   include the FreshService URL that gets returned, and add:
+   "If you have screenshots or other files to attach, please add them
+   directly to that link."
+
+Image handling: if the user sends screenshots or images during the conversation,
+describe what you observed in the summary field (error messages you read,
+what the screenshot shows) so the human agent has that context.
+
+If the user's message describes a new, unrelated issue from what was
+previously discussed, treat it as a new incident/project — restart the
+classification and question collection for that new item.
 
 Format your responses for Slack, not for a Markdown document:
-- Keep responses short. If a full answer would be long, give the 2-3 most important
-  next steps and offer to go deeper if needed. Do not dump entire runbooks unprompted.
-- Use *single asterisks* for bold, not **double asterisks** — Slack renders double
-  asterisks as literal characters.
-- Do not use Markdown headers like # or ###. If you need a section break, use a
-  short bolded phrase on its own line.
+- Keep responses short. If a full answer would be long, give the 2-3 most
+  important next steps and offer to go deeper if needed. Do not dump entire
+  runbooks unprompted.
+- Use *single asterisks* for bold, not **double asterisks** — Slack renders
+  double asterisks as literal characters.
+- Do not use Markdown headers like # or ###. If you need a section break,
+  use a short bolded phrase on its own line.
 - Prefer short flat bulleted lists. Avoid nesting bullets more than one level.
 - Do not repeat the same recommendation across multiple sections.
 - No closing summary or "let me know if..." lines unless genuinely useful.
@@ -69,31 +186,94 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "create_ticket",
+            "name": "create_incident_ticket",
             "description": (
-                "Create a FreshService IT support ticket. Use this only when you cannot "
-                "resolve the user's issue through conversation, or the request requires "
-                "human action. Not for simple questions you can answer directly. "
-                "Category and group assignment are not yet automated — tickets land "
-                "unclassified for manual triage."
+                "Create a FreshService ticket for an INCIDENT (something broken, "
+                "access request, existing-system issue). Only call after collecting "
+                "answers to every INCIDENT question."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "subject": {
                         "type": "string",
-                        "description": "Short, specific ticket subject line.",
+                        "description": "Short, specific subject line.",
                     },
-                    "description": {
+                    "summary": {
                         "type": "string",
                         "description": (
-                            "Clear description of the issue: what the user reported, "
-                            "what troubleshooting was already tried and its result, "
-                            "and any other relevant detail a human would need."
+                            "One-paragraph summary of the issue: what the user "
+                            "reported, what troubleshooting was tried, current "
+                            "state, and any relevant context from screenshots "
+                            "shared during the conversation."
+                        ),
+                    },
+                    "urgency": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": (
+                            "'high' only for system-down/work-blocking cases "
+                            "or explicit user language like urgent/critical/"
+                            "emergency. 'low' for cosmetic or informational "
+                            "requests the user has said aren't blocking. "
+                            "Otherwise 'medium'."
+                        ),
+                    },
+                    "request_type": {
+                        "type": "string",
+                        "enum": ["incident", "access_request"],
+                        "description": (
+                            "'access_request' for standard access/provisioning "
+                            "requests to existing systems. 'incident' for "
+                            "anything else (broken systems, errors, etc.)."
+                        ),
+                    },
+                    "answers": {
+                        "type": "object",
+                        "description": (
+                            "User's answers to each INCIDENT question, keyed by "
+                            "the question text. Every question must be present. "
+                            "'I don't know' is a valid answer."
                         ),
                     },
                 },
-                "required": ["subject", "description"],
+                "required": ["subject", "summary", "urgency", "request_type", "answers"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_project",
+            "description": (
+                "Create a FreshService Problem for a PROJECT (enhancement, new "
+                "functionality, new application, new build). Only call after "
+                "collecting answers to every PROJECT question."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "Short, specific project name / subject line.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "One-paragraph summary describing the project as the "
+                            "user has articulated it. Include what they want to "
+                            "accomplish and why."
+                        ),
+                    },
+                    "answers": {
+                        "type": "object",
+                        "description": (
+                            "User's answers to each PROJECT question, keyed by "
+                            "the question text. Every question must be present."
+                        ),
+                    },
+                },
+                "required": ["subject", "summary", "answers"],
             },
         },
     },
@@ -105,34 +285,180 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 def execute_tool(name: str, arguments: dict, is_admin: bool, requester_email: str = None) -> str:
-    if name == "create_ticket":
-        return _tool_create_ticket(
+    if name == "create_incident_ticket":
+        return _tool_create_incident(
             subject=arguments["subject"],
-            description=arguments["description"],
+            summary=arguments["summary"],
+            urgency=arguments.get("urgency", "medium"),
+            request_type=arguments.get("request_type", "incident"),
+            answers=arguments.get("answers", {}),
+            requester_email=requester_email,
+        )
+    if name == "create_project":
+        return _tool_create_project(
+            subject=arguments["subject"],
+            summary=arguments["summary"],
+            answers=arguments.get("answers", {}),
             requester_email=requester_email,
         )
     return f"Unknown tool: {name}"
 
 
-def _tool_create_ticket(subject: str, description: str, requester_email: str = None) -> str:
+def _esc(s):
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>"))
+
+
+def _format_body(summary: str, questions: list[str], answers: dict, attach_link: str) -> str:
+    """
+    Build a formatted HTML ticket/problem description with:
+      - Summary paragraph
+      - Structured Q&A section
+      - Note pointing user to attach files at the given FreshService link
+    """
+    parts = ["<p><b>Summary</b></p>", f"<p>{_esc(summary)}</p>", "<hr>",
+             "<p><b>Details</b></p>"]
+
+    for question in questions:
+        answer = answers.get(question)
+        if answer is None:
+            # Best-effort case-insensitive fallback if the model rephrased the key
+            for k, v in answers.items():
+                if k.strip().lower() == question.strip().lower():
+                    answer = v
+                    break
+        if answer is None:
+            answer = "(not provided)"
+        parts.append(f"<p><b>{_esc(question)}</b><br>{_esc(answer)}</p>")
+
+    parts.append("<hr>")
+    parts.append(
+        f'<p><i>If you have screenshots or other files to attach, please add '
+        f'them directly to this record: <a href="{attach_link}">{attach_link}</a></i></p>'
+    )
+    return "\n".join(parts)
+
+
+def _tool_create_incident(subject: str, summary: str, urgency: str, request_type: str, answers: dict, requester_email: str = None) -> str:
     if not requester_email:
-        log.warning("create_ticket called without a resolvable requester email.")
+        log.warning("create_incident_ticket called without a resolvable requester email.")
         return (
             "Could not create the ticket — no email address on file for this user. "
             "Ask them to email IT directly, or open the ticket manually."
         )
 
+    # FreshService priority mapping: 1=Low, 2=Medium, 3=High, 4=Urgent (unused)
+    priority_map = {"low": 1, "medium": 2, "high": 3}
+    priority = priority_map.get(urgency.strip().lower(), 2)
+
+    # Pick the question set to render in the ticket body based on request type.
+    questions = ACCESS_REQUEST_QUESTIONS if request_type.strip().lower() == "access_request" else INCIDENT_QUESTIONS
+
     try:
+        # Create with a placeholder attach link — we need the ID before we can
+        # build the real URL, and the URL needs to be inside the description.
+        placeholder_desc = _format_body(
+            summary=summary,
+            questions=questions,
+            answers=answers,
+            attach_link="(pending)",
+        )
         ticket = create_ticket(
             subject=subject,
-            description=description,
+            description=placeholder_desc,
             requester_email=requester_email,
+            priority=priority,
         )
         ticket_id = ticket.get("id")
-        return f"Ticket #{ticket_id} created successfully."
+        url = ticket_url(ticket_id)
+
+        # Patch the description with the real URL now that we have the ID.
+        final_desc = _format_body(
+            summary=summary,
+            questions=questions,
+            answers=answers,
+            attach_link=url,
+        )
+        try:
+            update_ticket_description(ticket_id, final_desc)
+        except Exception as e:
+            log.warning(f"Ticket #{ticket_id} created but description update failed: {e}")
+
+        return (
+            f"Ticket #{ticket_id} created ({urgency}). "
+            f"Reply to the user with this: 'Ticket #{ticket_id} has been opened: {url} "
+            f"If you have screenshots or other files to attach, please add them there.'"
+        )
     except Exception as e:
-        log.error(f"Ticket creation failed: {e}")
+        log.error(f"Incident ticket creation failed: {e}")
         return "Failed to create the ticket — let the user know to contact IT directly."
+
+
+def _tool_create_project(subject: str, summary: str, answers: dict, requester_email: str = None) -> str:
+    if not requester_email:
+        log.warning("create_project called without a resolvable requester email.")
+        return (
+            "Could not create the project — no email address on file for this user. "
+            "Ask them to email IT directly, or open the project manually."
+        )
+
+    try:
+        placeholder_desc = _format_body(
+            summary=summary,
+            questions=PROJECT_QUESTIONS,
+            answers=answers,
+            attach_link="(pending)",
+        )
+
+        # Map project answers → FreshService required custom fields.
+        # If the model rephrased a question key, _get_answer falls back to
+        # case-insensitive matching. Empty answers are safer than missing keys.
+        def _get_answer(question_text: str) -> str:
+            val = answers.get(question_text)
+            if val is None:
+                for k, v in answers.items():
+                    if k.strip().lower() == question_text.strip().lower():
+                        val = v
+                        break
+            return str(val) if val is not None else "Not provided"
+
+        custom_fields = {
+            "what_are_the_goals_of_this_project_provide_cost_benefit_details": _get_answer(PROJECT_QUESTIONS[0]),
+            "do_you_have_an_existing_workaround": _get_answer(PROJECT_QUESTIONS[1]),
+            "project_roi": _get_answer(PROJECT_QUESTIONS[2]),
+        }
+
+        problem = create_problem(
+            subject=subject,
+            description=placeholder_desc,
+            requester_email=requester_email,
+            custom_fields=custom_fields,
+        )
+        problem_id = problem.get("id")
+        url = problem_url(problem_id)
+
+        final_desc = _format_body(
+            summary=summary,
+            questions=PROJECT_QUESTIONS,
+            answers=answers,
+            attach_link=url,
+        )
+        try:
+            update_problem_description(problem_id, final_desc)
+        except Exception as e:
+            log.warning(f"Problem #{problem_id} created but description update failed: {e}")
+
+        return (
+            f"Project #{problem_id} created. "
+            f"Reply to the user with this: 'Project #{problem_id} has been logged: {url} "
+            f"If you have supporting documents or screenshots, please add them there.'"
+        )
+    except Exception as e:
+        log.error(f"Project creation failed: {e}")
+        return "Failed to create the project — let the user know to contact IT directly."
 
 
 # ---------------------------------------------------------------------------
