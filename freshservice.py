@@ -6,6 +6,13 @@ with the key as username and 'X' as password).
 
 Note: Roland Foods maps "Incidents" to FreshService Tickets and
 "Projects" to FreshService Problems — two different API resources.
+
+Multi-workspace: this file is used by two separate Chip processes,
+one per Slack workspace / owning company. The FreshService instance
+itself is shared, but each Chip creates records in its own workspace.
+The FRESHSERVICE_WORKSPACE_ID env var (short integer id, e.g. 2 or 5)
+controls which workspace new records land in. If unset, no workspace
+field is sent — record lands in the instance's default workspace.
 """
 
 import os
@@ -24,6 +31,16 @@ PROBLEM_URL_TEMPLATE = f"https://{FRESHSERVICE_DOMAIN}/a/problems/{{id}}"
 
 def _auth():
     return (os.environ["FRESHSERVICE_API_KEY"], "X")
+
+
+def _workspace_id() -> int | None:
+    """Return the workspace short-id from env, or None if not set.
+    Confirmed field values: Roland Foods = 2, other workspace = 5.
+    Do not confuse with primary_id from /api/v2/workspaces — that's
+    a different ID space that FreshService does not accept in payloads.
+    """
+    val = os.environ.get("FRESHSERVICE_WORKSPACE_ID")
+    return int(val) if val else None
 
 
 def create_ticket(
@@ -50,6 +67,9 @@ def create_ticket(
         "responder_id": int(os.environ["FRESHSERVICE_DEFAULT_RESPONDER_ID"]),
         "group_id": int(os.environ["FRESHSERVICE_DEFAULT_GROUP_ID"]),
     }
+    ws = _workspace_id()
+    if ws is not None:
+        payload["workspace_id"] = ws
 
     resp = requests.post(
         f"{BASE_URL}/tickets",
@@ -62,7 +82,7 @@ def create_ticket(
         resp.raise_for_status()
 
     ticket = resp.json().get("ticket", {})
-    log.info(f"Ticket created: #{ticket.get('id')} — {subject}")
+    log.info(f"Ticket created: #{ticket.get('id')} (workspace={ws}) — {subject}")
     return ticket
 
 
@@ -94,6 +114,9 @@ def create_problem(
     }
     if custom_fields:
         payload["custom_fields"] = custom_fields
+    ws = _workspace_id()
+    if ws is not None:
+        payload["workspace_id"] = ws
 
     resp = requests.post(
         f"{BASE_URL}/problems",
@@ -106,7 +129,7 @@ def create_problem(
         resp.raise_for_status()
 
     problem = resp.json().get("problem", {})
-    log.info(f"Problem created: #{problem.get('id')} — {subject}")
+    log.info(f"Problem created: #{problem.get('id')} (workspace={ws}) — {subject}")
     return problem
 
 
