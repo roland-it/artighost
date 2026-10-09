@@ -44,7 +44,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # When True, no FreshService tickets are created. Instead, a single summary
 # email is sent to DRY_RUN_RECIPIENT with everything that WOULD have been
 # created. Flip to False to go live.
-DRY_RUN = True
+DRY_RUN = False
 DRY_RUN_RECIPIENT = os.environ.get("DRY_RUN_RECIPIENT", "paulc_admin@rolandfoods.com")
 
 openai_client = OpenAI(
@@ -224,8 +224,20 @@ def fetch_todays_records(email: str, day_eastern: datetime.date) -> list[dict]:
             continue
 
         for r in found:
-            created = r.get("created_at", "")
-            if created.startswith(day_str):
+            created_raw = r.get("created_at", "")
+            if not created_raw:
+                continue
+            # FreshService returns created_at in UTC (ISO 8601 with Z).
+            # Convert to Eastern before comparing to day_eastern so that
+            # late-evening Eastern tickets (which have a next-day UTC date)
+            # are correctly attributed to the Eastern day they were created.
+            try:
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                created_eastern_date = created_dt.astimezone(EASTERN).date()
+            except Exception as e:
+                log.warning(f"  could not parse created_at={created_raw!r}: {e}")
+                continue
+            if created_eastern_date == day_eastern:
                 records.append({
                     "type": rec_type,
                     "subject": r.get("subject", ""),
@@ -239,14 +251,23 @@ DEDUP_PROMPT = """
 You are comparing a newly-detected conversation topic against existing
 FreshService tickets and problems the same user opened today.
 
-Decide whether the new topic is the SAME UNDERLYING ISSUE as any of the
-existing records. Phrasing may differ; use judgment about the actual
-subject matter. If the new topic is clearly about something different,
-answer no.
+Decide whether the new topic refers to the SAME UNDERLYING ISSUE as any
+one of the existing records. Phrasing WILL differ — the real ticket and
+the conversation summary were written at different times by different
+sources. Use judgment about the actual subject matter.
 
-Return ONLY valid JSON, no prose, no code fences:
+LEAN TOWARD "YES". If there is reasonable overlap in topic, application,
+or symptom with ANY existing record, mark it a duplicate. The cost of a
+false duplicate (missing one legit log entry) is much lower than the cost
+of a missed duplicate (an extra ticket IT staff must close out). Only
+answer "no" when the new topic is clearly, unmistakably about something
+different from EVERY existing record.
+
+Return ONLY valid JSON, no prose, no code fences. Also include a short
+one-line reason so logs can show your decision:
 {
-  "is_duplicate": true|false
+  "is_duplicate": true|false,
+  "reason": "short explanation naming which existing record it matches (or why nothing matches)"
 }
 """.strip()
 
@@ -278,12 +299,21 @@ def topic_matches_existing(new_subject: str, new_transcript: str, existing_recor
                 {"role": "system", "content": DEDUP_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            max_completion_tokens=50,
+            max_completion_tokens=200,
             temperature=0,
         )
         raw = resp.choices[0].message.content.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-        return bool(json.loads(raw).get("is_duplicate", False))
+        parsed = json.loads(raw)
+        verdict = bool(parsed.get("is_duplicate", False))
+        reason = parsed.get("reason", "(no reason given)")
+        existing_subjects = [f"[{r['type']}] {r['subject']}" for r in existing_records]
+        log.info(
+            f"  dedup check: new='{new_subject}' "
+            f"vs {len(existing_records)} existing [{'; '.join(existing_subjects)}] "
+            f"→ is_duplicate={verdict} reason={reason!r}"
+        )
+        return verdict
     except Exception as e:
         log.warning(f"Dedup check failed for '{new_subject}', defaulting to not-duplicate: {e}")
         return False
