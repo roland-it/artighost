@@ -13,6 +13,7 @@ from conversation import handle_message  # used by Slack handlers and Outlook po
 from admin import handle_admin_command
 from config import load_config
 from permissions import is_admin, can_perform
+from heartbeat import start_heartbeat
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -173,5 +174,6 @@ if __name__ == "__main__":
     #     from outlook import start_poller
     #     start_poller(handle_message)
     #     log.info("Outlook poller started.")
+    start_heartbeat()
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
